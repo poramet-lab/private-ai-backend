@@ -1,0 +1,295 @@
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+import httpx, os
+
+router = APIRouter(prefix="/chat", tags=["chat"])
+
+OLLAMA_GEN = "http://127.0.0.1:11435/api/generate"
+OLLAMA_EMB = "http://127.0.0.1:11435/api/embeddings"
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+QDRANT_URL = "http://127.0.0.1:6333"
+COLLECTION = "demo_rag"
+
+class Message(BaseModel):
+    role: str
+    content: str
+
+class Controls(BaseModel):
+    model_selection: str = Field("chatgpt", description="'chatgpt' | 'local'")
+    model_name: str = Field("gpt-4o-mini")
+    temperature: float = 0.2
+    top_p: float = 0.9
+    max_tokens: int = 512
+    language: str = "th"
+    # Auto re-augment
+    auto_reaugment: bool = True
+    room_scope: str = Field("project", description="'room' หรือ 'project'")
+    max_extra_k: int = Field(3, ge=0, le=10)
+    score_threshold: float = 0.30
+    # Logging
+    log_history: bool = True
+    # NEW: บังคับค้นเพิ่มก่อนตอบเสมอ
+    force_reaugment: bool = False
+    force_reaugment: bool = False  # บังคับค้น RAG ก่อนตอบเสมอ
+
+class Packet(BaseModel):
+    question: str
+    recent_window: list[Message] = []
+    rag_bundle: str = ""
+    controls: Controls
+    # ตัวกรองสโคป/เวลา (ใช้ตอน auto-reaugment)
+    project_id: str | None = None
+    room_id: str | None = None
+    after: int | None = None
+    before: int | None = None
+    # สำหรับบันทึกประวัติ
+    username: str | None = None
+
+class GenResp(BaseModel):
+    provider: str
+    used_model: str
+    answer: str
+    sources: list[dict] = []
+
+def build_prompt(p: Packet, ctx: str) -> str:
+    recent = "\n".join(f"{m.role}: {m.content}" for m in p.recent_window)
+    return (
+        "คุณคือผู้ช่วยทีมพัฒนาซอฟต์แวร์ ตอบเป็นภาษาไทยเท่านั้น และตอบแบบ bullet สั้น กระชับ ไม่เกิน 8 บรรทัด\n"
+        "ห้ามใส่ข้อมูลนอกเหนือจากบริบท ถ้าไม่พอให้ตอบว่า \"ข้อมูลไม่พอ\"\n\n"
+        f"[บริบทจาก RAG]\n{ctx}\n\n"
+        f"[บริบทล่าสุด]\n{recent}\n\n"
+        f"[คำถาม]\n{p.question}"
+    )
+
+def seems_insufficient(text: str) -> bool:
+    txt = (text or "").strip()
+    if len(txt) < 20:
+        return True
+    for kw in ("ข้อมูลไม่พอ", "ไม่พบข้อมูล", "ไม่มีข้อมูลพอ", "ไม่พอ"):
+        if kw in txt:
+            return True
+    return False
+
+async def call_local_model(client: httpx.AsyncClient, model: str, prompt: str, temperature: float, top_p: float, max_tokens: int) -> str:
+    r = await client.post(OLLAMA_GEN, json={
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": temperature, "top_p": top_p, "num_predict": max_tokens}
+    })
+    if r.status_code != 200:
+        raise HTTPException(500, f"Ollama error: {r.text}")
+    return r.json().get("response","").strip()
+
+async def call_chatgpt(client: httpx.AsyncClient, model: str, prompt: str, temperature: float, max_tokens: int) -> str:
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        raise HTTPException(400, "Missing OPENAI_API_KEY")
+    r = await client.post(OPENAI_URL, json={
+        "model": model,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "messages": [
+            {"role":"system","content":"ตอบเป็นภาษาไทยเท่านั้น แบบ bullet สั้น กระชับ"},
+            {"role":"user","content": prompt}
+        ]
+    }, headers={"Authorization": f"Bearer {key}"})
+    if r.status_code != 200:
+        raise HTTPException(500, f"OpenAI error: {r.text}")
+    return r.json()["choices"][0]["message"]["content"].strip()
+
+async def embed_query(client: httpx.AsyncClient, text: str) -> list[float]:
+    r = await client.post(OLLAMA_EMB, json={"model":"bge-m3","prompt": text})
+    if r.status_code != 200:
+        raise HTTPException(500, f"Ollama embeddings error: {r.text}")
+    emb = r.json().get("embedding")
+    if not emb:
+        raise HTTPException(500, "No embedding returned")
+    return emb
+
+async def search_qdrant(
+    client: httpx.AsyncClient, emb: list[float], *,
+    limit: int, score_threshold: float,
+    scope: str, room_id: str | None, project_id: str | None,
+    after: int | None, before: int | None
+):
+    must_filters = []
+    if scope == "room" and room_id:
+        must_filters.append({"key":"room_id","match":{"value":room_id}})
+    elif project_id:
+        must_filters.append({"key":"project_id","match":{"value":project_id}})
+    # เวลา
+    if after is not None or before is not None:
+        rng = {}
+        if after is not None:
+            rng["gte"] = int(after)
+        if before is not None:
+            rng["lte"] = int(before)
+        must_filters.append({"key":"created_at","range": rng})
+
+    search = {
+        "vector": emb,
+        "limit": limit,
+        "with_payload": True,
+        "with_vectors": False,
+        "score_threshold": score_threshold
+    }
+    if must_filters:
+        search["filter"] = {"must": must_filters}
+
+    r = await client.post(f"{QDRANT_URL}/collections/{COLLECTION}/points/search", json=search)
+    if r.status_code != 200:
+        raise HTTPException(500, f"Qdrant search error: {r.text}")
+    return r.json().get("result", [])
+
+@router.post("/generate", response_model=GenResp)
+async def generate(p: Packet):
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        # ถ้าเปิด force_reaugment: ค้นหาจากเวกเตอร์ก่อน แล้วต่อบริบทเพิ่ม
+        if p.controls.auto_reaugment and p.controls.force_reaugment and p.controls.max_extra_k > 0:
+            emb0 = await embed_query(client, p.question)
+            results0 = await search_qdrant(
+                client, emb0,
+                limit=max(3, p.controls.max_extra_k),
+                score_threshold=p.controls.score_threshold,
+                scope=p.controls.room_scope,
+                room_id=p.room_id,
+                project_id=p.project_id,
+                after=p.after,
+                before=p.before
+            )
+            # ต่อแหล่งที่มาเข้า rag_bundle (ยังไม่เติมใน sources ตอบสุดท้าย)
+            base0 = p.rag_bundle
+            appended0 = 0
+            pre_sources = []
+            for pt in results0:
+                pl0 = pt.get("payload") or {}
+                fp0 = (pl0.get("file_path") or "")
+                prev0 = (pl0.get("preview") or "").strip()
+                if fp0 and (fp0.split("/")[-1] in base0):
+                    continue
+                base0 += f"\n\n--- [PRE-ADD] id={pt.get('id')} room={pl0.get('room_id')} file={fp0}\n{prev0[:1200]}"
+                appended0 += 1
+                pre_sources.append({
+                    "id": pt.get("id"),
+                    "score": round(float(pt.get("score", 0.0)), 3),
+                    "room": pl0.get("room_id"),
+                    "file": fp0.split("/")[-1] if fp0 else None
+                })
+
+                if appended0 >= p.controls.max_extra_k:
+                    break
+            p.rag_bundle = base0
+        prompt = build_prompt(p, p.rag_bundle)
+                # ถ้าเปิด force_reaugment: ค้นหาจากเวกเตอร์ก่อน แล้วต่อบริบทเข้า rag_bundle
+        if p.controls.auto_reaugment and p.controls.force_reaugment and p.controls.max_extra_k > 0:
+            emb0 = await embed_query(client, p.question)
+            results0 = await search_qdrant(
+                client, emb0,
+                limit=max(3, p.controls.max_extra_k),
+                score_threshold=p.controls.score_threshold,
+                scope=p.controls.room_scope,
+                room_id=p.room_id,
+                project_id=p.project_id,
+                after=p.after,
+                before=p.before
+            )
+
+            # สะสมรายชื่อแหล่งที่มาจาก pre-augment ไว้โชว์ใน sources ด้วย
+            pre_sources = []
+            base0 = p.rag_bundle
+            appended0 = 0
+            for pt in results0:
+                pl0 = pt.get("payload") or {}
+                fp0 = (pl0.get("file_path") or "")
+                prev0 = (pl0.get("preview") or "").strip()
+
+                # กันซ้ำถ้าไฟล์นั้นถูกต่อไปแล้วใน base0
+                if fp0 and (fp0.split("/")[-1] in base0):
+                    continue
+
+                # เก็บลง sources สำหรับแสดงผล
+                pre_sources.append({
+                    "id": pt.get("id"),
+                    "score": round(float(pt.get("score", 0.0)), 3),
+                    "room": pl0.get("room_id"),
+                    "file": fp0.split("/")[-1] if fp0 else None
+                })
+
+                # ต่อบริบทเข้า rag_bundle
+                base0 += f"\n\n--- [PRE-ADD] id={pt.get('id')} room={pl0.get('room_id')} file={fp0}\n{prev0[:1200]}"
+                appended0 += 1
+                if appended0 >= p.controls.max_extra_k:
+                    break
+
+            # อัปเดต rag_bundle และตั้งค่า added เริ่มต้นด้วย pre_sources
+            p.rag_bundle = base0
+            added = pre_sources[:]
+        else:
+            added = []
+
+
+        added = []
+        if p.controls.auto_reaugment and seems_insufficient(ans) and p.controls.max_extra_k > 0:
+            emb = await embed_query(client, p.question)
+            results = await search_qdrant(
+                client, emb,
+                limit=max(3, p.controls.max_extra_k),
+                score_threshold=p.controls.score_threshold,
+                scope=p.controls.room_scope,
+                room_id=p.room_id,
+                project_id=p.project_id,
+                after=p.after,
+                before=p.before
+            )
+            base = p.rag_bundle
+            appended = 0
+            for pt in results:
+                pl = pt.get("payload") or {}
+                fp = (pl.get("file_path") or "")
+                fname = fp.split("/")[-1] if fp else ""
+                prev = (pl.get("preview") or "").strip()
+                if fname and (fname in base):
+                    continue
+                added.append({
+                    "id": pt.get("id"),
+                    "score": round(float(pt.get("score", 0.0)),3),
+                    "room": pl.get("room_id"),
+                    "file": fname
+                })
+                base += f"\n\n--- [AUTO-ADD] id={pt.get('id')} room={pl.get('room_id')} file={fp}\n{prev[:1200]}"
+                appended += 1
+                if appended >= p.controls.max_extra_k:
+                    break
+            if appended > 0:
+                prompt2 = build_prompt(p, base)
+                if provider == "local":
+                    ans = await call_local_model(client, p.controls.model_name, prompt2, p.controls.temperature, p.controls.top_p, p.controls.max_tokens)
+                else:
+                    ans = await call_chatgpt(client, p.controls.model_name, prompt2, p.controls.temperature, p.controls.max_tokens)
+
+        # บันทึกประวัติ (ถ้าเปิดไว้และมี room_id)
+        if p.controls.log_history and p.room_id:
+            try:
+                await client.post(
+                    f"http://127.0.0.1:8081/rooms/{p.room_id}/messages",
+                    params={"project_id":"demo"},
+                    json={"role":"user","content":p.question,"username": (p.username or "user")}
+                )
+                await client.post(
+                    f"http://127.0.0.1:8081/rooms/{p.room_id}/messages",
+                    params={"project_id":"demo"},
+                    json={"role":"assistant","content":ans,"username":"ai","meta":{"provider":provider,"model":p.controls.model_name,"sources":added}}
+                )
+            except Exception:
+                pass
+
+                # ... ในฟังก์ชัน endpoint ของเรา (เช่น async def generate(...)):
+                provider = "chatgpt" if p.controls.model_selection == "chatgpt" else "local"
+                # ... สร้างค่า used_model / final_answer / sources ...
+                return GenResp(
+                    provider=provider,
+                    used_model=chosen_model_name,
+                    answer=final_answer,
+                    sources=sources,
+                )
