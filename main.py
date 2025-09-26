@@ -21,3 +21,6 @@ app.include_router(rag_router)
 @app.get("/health")
 def health():
     return JSONResponse({"status":"ok","service":"private-ai-backend"})
+
+from code_api import router as code_router
+app.include_router(code_router)
