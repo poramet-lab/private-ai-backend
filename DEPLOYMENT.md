@@ -4,9 +4,10 @@
 
 ## 1. สิ่งที่ต้องมี (Prerequisites)
 
-- **Docker:** ติดตั้ง Docker
-- **Docker Compose:** โดยปกติจะมาพร้อมกับ Docker Desktop หากใช้ Linux ต้อง ติดตั้งแยก
 - **Git:** สำหรับ Clone โปรเจกต์
+- **Docker & Docker Compose:**
+  - **Windows/Mac:** ติดตั้ง [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+  - **Linux (Ubuntu/Debian):** ติดตั้งผ่าน Terminal โดยทำตาม [คู่มืออย่างเป็นทางการของ Docker](https://docs.docker.com/engine/install/ubuntu/) ซึ่งจะติดตั้งทั้ง Docker Engine และ Docker Compose Plugin ให้พร้อมกัน
 - **NVIDIA GPU (แนะนำ):** หากต้องการให้ Ollama ทำงานบน GPU ต้องติดตั้ง NVIDIA Container Toolkit
 
 ## 2. ขั้นตอนการติดตั้ง (Setup)
