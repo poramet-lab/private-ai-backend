@@ -4,7 +4,7 @@ import httpx, time, os
 
 router = APIRouter(prefix="/context", tags=["context"])
 
-QDRANT_URL = "http://127.0.0.1:6333"
+QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 COLLECTION = "demo_rag"
 
 class BundleReq(BaseModel):

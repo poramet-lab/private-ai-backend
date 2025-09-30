@@ -6,8 +6,8 @@ router = APIRouter(prefix="/ingest", tags=["ingest"])
 
 # Phase 1: ใช้โลคอลเท่านั้น
 BASE_DIR = os.path.expanduser("~/private-ai/projects")
-OLLAMA_URL = "http://127.0.0.1:11435"
-QDRANT_URL = "http://127.0.0.1:6333"
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11435")
+QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 COLLECTION = "demo_rag"
 
 ALLOWED_EXT = {".md",".txt",".csv",".py"}

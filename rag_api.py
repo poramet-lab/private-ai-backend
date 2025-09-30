@@ -1,12 +1,13 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 import httpx
+import os
 
 router = APIRouter(prefix="/rag", tags=["rag"])
 
 # ปรับ URL ให้ตรงกับที่เราตั้งไว้
-OLLAMA_URL = "http://127.0.0.1:11435"
-QDRANT_URL = "http://127.0.0.1:6333"
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11435")
+QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 COLLECTION = "demo_rag"
 
 class SearchReq(BaseModel):
